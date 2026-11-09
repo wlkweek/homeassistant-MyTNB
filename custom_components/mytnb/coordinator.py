@@ -27,6 +27,7 @@ from .api import (
     MyTNBAuthError,
     MyTNBClient,
     MyTNBConnectionError,
+    MyTNBCredentialsError,
     SmartMeterData,
 )
 from .const import (
@@ -62,9 +63,14 @@ class MyTNBCoordinator(DataUpdateCoordinator[SmartMeterData]):
         now = datetime.now(TIMEZONE)
         try:
             data = await self.client.async_get_data(now - FETCH_WINDOW, now + timedelta(days=1))
-        except MyTNBAuthError as err:
+        except MyTNBCredentialsError as err:
+            # Only a rejected username/password is worth asking the user about.
             raise ConfigEntryAuthFailed(f"Authentication with MyTNB failed: {err}") from err
-        except MyTNBConnectionError as err:
+        except (MyTNBAuthError, MyTNBConnectionError) as err:
+            # An expired or not-yet-propagated TNB session is transient.
+            # ConfigEntryAuthFailed would stop the coordinator from
+            # scheduling further refreshes and demand a password that is
+            # in fact correct, so retry on the next poll instead.
             raise UpdateFailed(f"Could not fetch data from MyTNB: {err}") from err
 
         await self._async_insert_statistics("usage", data.usage, UnitOfEnergy.KILO_WATT_HOUR)

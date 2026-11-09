@@ -155,3 +155,49 @@ def test_parse_points_handles_malformed_payloads():
 def test_extract_smartmeter_path():
     path = api.extract_smartmeter_path(SMARTMETER_URL)
     assert path == "/AccountManagement/SmartMeter/Index/TRIL?caNo=TESTCA"
+
+
+async def test_bad_credentials_raise_credentials_error(client, fake_tnb):
+    """A rejected password must be distinguishable from an expired session."""
+    fake_tnb.login_body = "<html>Invalid email or password</html>"
+    with pytest.raises(api.MyTNBCredentialsError):
+        await client.async_authenticate()
+
+
+async def test_expired_session_is_not_a_credentials_error(client, fake_tnb, monkeypatch):
+    """A persistent login redirect must never be reported as a bad password.
+
+    This is the bug behind the endless reauthentication prompts: the
+    coordinator used to turn every session failure into an auth failure.
+    """
+    monkeypatch.setattr(api, "_SESSION_LAG_RETRIES", 1)
+    fake_tnb.timeseries = {"usage": [LOGIN_REDIRECT_JSON], "cost": [COST_OK]}
+
+    with pytest.raises(api.MyTNBAuthError) as exc_info:
+        await client.async_get_data(START, END)
+
+    assert not isinstance(exc_info.value, api.MyTNBCredentialsError)
+
+
+async def test_session_is_reused_within_ttl(client, fake_tnb):
+    """A fetch inside the token lifetime must not log in again."""
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+
+    await client.async_get_data(START, END)
+    await client.async_get_data(START, END)
+
+    assert fake_tnb.login_count == 1
+
+
+async def test_stale_session_logs_in_before_fetching(client, fake_tnb, monkeypatch):
+    """A session past TNB's 30 minute lifetime is renewed up front."""
+    fake_tnb.timeseries = {"usage": [USAGE_OK], "cost": [COST_OK]}
+    await client.async_get_data(START, END)
+
+    # Pretend the login happened longer ago than the token lives.
+    client._last_login -= api.SESSION_TTL + 1
+    await client.async_get_data(START, END)
+
+    assert fake_tnb.login_count == 2
+    assert fake_tnb.commodity_visits == ["usage", "cost", "usage", "cost"]
+

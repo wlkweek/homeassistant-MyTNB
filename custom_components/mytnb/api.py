@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -61,8 +62,22 @@ _SDPUDCID_RE = re.compile(r'"sdpudcid":"(\d+)"')
 _POINT_DATETIME_FORMAT = "%Y-%m-%d %H:%M"
 _REQUEST_DATE_FORMAT = "%Y-%m-%d+00:00"
 
-_SESSION_LAG_RETRIES = 3
-_SESSION_LAG_DELAY = 2.0
+# TNB's SSO session cookie (``ssoToken``) is issued with a fixed,
+# non-sliding lifetime of about 30 minutes; activity does not extend it.
+# Measured on the live portal, so the value is a hard limit rather than a
+# guess. A poll interval longer than this always starts from a dead session.
+SESSION_TTL = 30 * 60
+
+# A freshly created session keeps propagating on TNB's side for a while, so
+# the first requests after login can still be redirected to the login page.
+# Retries back off exponentially: 3 + 6 + 12 = 21 seconds by default.
+_SESSION_LAG_RETRIES = 4
+_SESSION_LAG_DELAY = 3.0
+
+
+def _retry_delay(attempt: int) -> float:
+    """Return the backoff before retry ``attempt`` (0-based)."""
+    return _SESSION_LAG_DELAY * (2**attempt)
 
 
 class MyTNBError(Exception):
@@ -70,7 +85,19 @@ class MyTNBError(Exception):
 
 
 class MyTNBAuthError(MyTNBError):
-    """Credentials rejected, or the session is missing/expired."""
+    """The session is missing, expired, or not yet propagated.
+
+    This is transient: logging in again, or simply trying on the next
+    poll, recovers it. It must not be reported to Home Assistant as
+    invalid credentials.
+    """
+
+
+class MyTNBCredentialsError(MyTNBAuthError):
+    """The username or password was rejected by the login endpoint.
+
+    Only this subclass warrants prompting the user to reauthenticate.
+    """
 
 
 class MyTNBConnectionError(MyTNBError):
@@ -121,7 +148,18 @@ class MyTNBClient:
         self._smartmeter_path = extract_smartmeter_path(smartmeter_url)
         self._auth_lock = asyncio.Lock()
         self._authenticated = False
+        self._last_login: float | None = None
         self.sdpudcid: str | None = None
+
+    def _session_expired(self) -> bool:
+        """Return True if the session is older than TNB's fixed token lifetime.
+
+        Checking before the fetch avoids spending the retry budget on
+        requests that cannot succeed.
+        """
+        if self._last_login is None:
+            return True
+        return (time.monotonic() - self._last_login) >= SESSION_TTL - 60
 
     async def async_authenticate(self) -> str:
         """Run the full login flow; returns the meter's sdpudcid."""
@@ -142,10 +180,10 @@ class MyTNBClient:
             return await self._fetch_all(start, end)
 
     async def _ensure_authenticated(self) -> None:
-        if self._authenticated:
+        if self._authenticated and not self._session_expired():
             return
         async with self._auth_lock:
-            if not self._authenticated:
+            if not self._authenticated or self._session_expired():
                 await self._login()
 
     async def _login(self) -> None:
@@ -158,14 +196,27 @@ class MyTNBClient:
             async with self._session.post(
                 _LOGIN_URL, data={"Email": self._username, "Password": self._password}
             ) as response:
+                if response.status in (401, 403):
+                    raise MyTNBCredentialsError(
+                        f"Login endpoint rejected the credentials (status {response.status})"
+                    )
                 response.raise_for_status()
                 form_fields = dict(_FORM_FIELD_RE.findall(await response.text()))
             if not form_fields:
-                raise MyTNBAuthError("Login page returned no SSO form fields (bad credentials?)")
+                raise MyTNBCredentialsError(
+                    "Login page returned no SSO form fields (bad credentials?)"
+                )
 
             async with self._session.post(_SSO_URL, data=form_fields) as response:
-                if response.status != 200:
-                    raise MyTNBAuthError(f"SSO handler rejected login with status {response.status}")
+                if response.status in (401, 403):
+                    raise MyTNBCredentialsError(
+                        f"SSO handler rejected login with status {response.status}"
+                    )
+                if response.status >= 500:
+                    raise MyTNBConnectionError(
+                        f"SSO handler failed with status {response.status}"
+                    )
+                response.raise_for_status()
 
             async with self._session.get(f"{_ACCOUNT_BASE}{self._smartmeter_path}") as response:
                 if response.status != 200:
@@ -177,6 +228,7 @@ class MyTNBClient:
 
         self.sdpudcid = await self._fetch_sdpudcid()
         self._authenticated = True
+        self._last_login = time.monotonic()
         _LOGGER.debug("Login flow completed; sdpudcid=%s", self.sdpudcid)
 
     async def _fetch_sdpudcid(self) -> str:
@@ -213,7 +265,7 @@ class MyTNBClient:
                 len(text),
             )
             if attempt < _SESSION_LAG_RETRIES - 1:
-                await asyncio.sleep(_SESSION_LAG_DELAY)
+                await asyncio.sleep(_retry_delay(attempt))
 
         raise MyTNBAuthError(
             f"No sdpudcid in dashboard response after {_SESSION_LAG_RETRIES} attempts"
@@ -274,7 +326,7 @@ class MyTNBClient:
                 # Redirect loops on the commodity page are transient during
                 # session propagation, same as the redirect-JSON below.
                 if attempt < _SESSION_LAG_RETRIES - 1:
-                    await asyncio.sleep(_SESSION_LAG_DELAY)
+                    await asyncio.sleep(_retry_delay(attempt))
                     continue
                 raise
 
@@ -311,7 +363,7 @@ class MyTNBClient:
                 _SESSION_LAG_RETRIES,
             )
             if attempt < _SESSION_LAG_RETRIES - 1:
-                await asyncio.sleep(_SESSION_LAG_DELAY)
+                await asyncio.sleep(_retry_delay(attempt))
 
         raise MyTNBAuthError(
             f"Timeseries {metric} kept redirecting to login after {_SESSION_LAG_RETRIES} attempts"
